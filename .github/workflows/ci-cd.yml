@@ -44,7 +44,9 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 22
           script: |
+            cd myapp/hw2_actions 
             docker stop melkonyan-container 2>/dev/null || echo "Container not running"
             docker rmi melkonyan-app 2>/dev/null || echo "Image not running"
+            git pull origin main
             docker build -t melkonyan-app .
             docker run --rm -d -p 3000:3000 melkonyan-app --name melkonyan-container
