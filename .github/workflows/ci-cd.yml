@@ -49,4 +49,4 @@ jobs:
             docker rmi melkonyan-app:latest 2>/dev/null || echo "Image not running"
             git pull origin main
             docker build -t melkonyan-app:latest .
-            docker run --rm -d -p 3000:3000 melkonyan-app:latest --name melkonyan-container
+            docker run --rm -d --name melkonyan-container -p 3000:3000 melkonyan-app:latest
