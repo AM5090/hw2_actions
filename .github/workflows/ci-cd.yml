@@ -44,7 +44,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 22
           script: |
-            docker stop melkonyan-container
+            docker stop melkonyan-container || true
             docker rmi melkonyan-app
             docker build -t melkonyan-app .
             docker run --rm -d -p 3000:3000 melkonyan-app --name melkonyan-container
