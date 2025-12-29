@@ -39,11 +39,30 @@ jobs:
         run: |
           npm install -g @cyclonedx/cyclonedx-npm
 
-      - name: Generate SBOM
+      - name: Generate SBOM with Syft
         id: generate_sbom
         run: |
-          cyclonedx-npm --output-file sbom.json
-          echo "sbom_path=sbom.json" >> $GITHUB_OUTPUT
+          # Установка Syft
+          echo "Installing Syft..."
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+          # Проверяем наличие package-lock.json
+          if [ -f "package-lock.json" ]; then
+            echo "Generating SBOM from package-lock.json..."
+            syft packages npm:package-lock.json -o cyclonedx-json > sbom.json
+          else
+            echo "Generating SBOM from installed node_modules..."
+            syft packages dir:. -o cyclonedx-json > sbom.json
+          fi
+
+          # Проверяем что файл создан
+          if [ -f "sbom.json" ]; then
+            echo "SBOM generated successfully: $(ls -lh sbom.json)"
+            echo "sbom_path=sbom.json" >> $GITHUB_OUTPUT
+          else
+            echo "ERROR: Failed to generate SBOM"
+            exit 1
+          fi
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
