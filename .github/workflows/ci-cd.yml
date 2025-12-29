@@ -1,17 +1,13 @@
-name: hw2 ci-cd
+name: HW3 Security
 
 on:
-  push:
-    branches: ["main"]
   pull_request:
     branches: ["main"]
+    types: [opened, synchronize, reopened] # Только при создании/обновлении MR
 
 jobs:
   install:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -21,12 +17,135 @@ jobs:
           node-version: "16"
       - name: Install dependencies
         run: npm install
-  test:
+
+  # Стадия генерации SBOM
+  build:
     needs: install
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ubuntu-latest
+    outputs:
+      sbom_file: ${{ steps.generate_sbom.outputs.sbom_path }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      - name: Install CycloneDX generator
+        run: |
+          npm install -g @cyclonedx/cyclonedx-npm
+
+      - name: Generate SBOM
+        id: generate_sbom
+        run: |
+          cyclonedx-npm --output-file sbom.json
+          echo "SBOM generated: $(ls -la sbom.json)"
+          echo "sbom_path=sbom.json" >> $GITHUB_OUTPUT
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-report
+          path: sbom.json
+          retention-days: 7
+
+      - name: Optional | Upload to Dependency Track
+        if: env.DEPENDENCY_TRACK_URL != ''
+        env:
+          DEPENDENCY_TRACK_URL: ${{ secrets.DEPENDENCY_TRACK_URL }}
+          DEPENDENCY_TRACK_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+        run: |
+          curl -X "POST" "$DEPENDENCY_TRACK_URL/api/v1/bom" \
+            -H "Content-Type: multipart/form-data" \
+            -H "X-Api-Key: $DEPENDENCY_TRACK_API_KEY" \
+            -F "autoCreate=true" \
+            -F "projectName=${{ github.event.repository.name }}" \
+            -F "projectVersion=${{ github.sha }}" \
+            -F "bom=@sbom.json"
+
+  # Стадия анализа безопасности
+  security:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "16"
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: sbom-report
+
+      - name: Run OWASP Dependency Check
+        id: dependency_check
+        run: |
+          wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.3.1/dependency-check-8.3.1-release.zip
+          unzip dependency-check-8.3.1-release.zip
+
+          ./dependency-check/bin/dependency-check.sh \
+            --scan . \
+            --format "HTML" \
+            --format "JSON" \
+            --out "dependency-check-report" \
+            --project "${{ github.event.repository.name }}" \
+            --disableAssembly \
+            --failOnCVSS 7
+
+          if [ -f "dependency-check-report.json" ]; then
+            VULNERABILITIES=$(jq '.dependencies[]?.vulnerabilities? | length' dependency-check-report.json | awk '{sum+=$1} END {print sum}')
+            echo "vulnerabilities_count=$VULNERABILITIES" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Dependency Check report
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-reports
+          path: |
+            dependency-check-report.html
+            dependency-check-report.json
+          retention-days: 7 # Хранение 1 неделю
+
+      - name: Run npm audit
+        continue-on-error: true # Продолжать даже при обнаружении уязвимостей
+        run: |
+          npm audit --json > npm-audit-report.json || true
+
+      - name: Upload npm audit report
+        uses: actions/upload-artifact@v3
+        with:
+          name: npm-audit-report
+          path: npm-audit-report.json
+          retention-days: 7
+
+      - name: Analyze SBOM with Trivy
+        if: always()
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+          trivy sbom sbom.json --format json --output trivy-sbom-report.json
+          trivy sbom sbom.json --format table
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-reports
+          path: trivy-sbom-report.json
+          retention-days: 7
+
+  test:
+    needs: security
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -36,8 +155,10 @@ jobs:
         run: npm ci --legacy-peer-deps --no-audit --force --verbose
       - name: Run tests
         run: npm test
+
   deploy:
-    needs: test
+    needs: [test, security]
+    if: ${{ github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
@@ -54,3 +175,77 @@ jobs:
             git pull origin main
             docker build -t melkonyan-app:latest .
             docker run --rm -d --name melkonyan-container -p 3000:3000 melkonyan-app:latest
+
+  security-summary:
+    needs: [security, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all security reports
+        uses: actions/download-artifact@v3
+        with:
+          path: security-reports
+
+      - name: Generate security summary
+        run: |
+          echo "=== Security Analysis Summary ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Date: $(date)"
+          echo ""
+
+          if [ -f "security-reports/dependency-check-report.json" ]; then
+            echo "✅ Dependency Check report generated"
+            VULNS=$(jq '.dependencies[]?.vulnerabilities? | length' security-reports/dependency-check-report.json 2>/dev/null | awk '{sum+=$1} END {print sum+0}')
+            echo "   Found vulnerabilities: $VULNS"
+          else
+            echo "❌ Dependency Check report not found"
+          fi
+
+          if [ -f "security-reports/npm-audit-report.json" ]; then
+            echo "✅ npm audit report generated"
+          else
+            echo "❌ npm audit report not found"
+          fi
+
+          if [ -f "security-reports/trivy-sbom-report.json" ]; then
+            echo "✅ Trivy SBOM report generated"
+          else
+            echo "❌ Trivy SBOM report not found"
+          fi
+
+          echo ""
+          echo "Artifacts are stored for 7 days"
+
+      - name: Comment on PR with summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            let summary = "## 🔒 Security Analysis Report\n\n";
+
+            try {
+              if (fs.existsSync('security-reports/dependency-check-report.json')) {
+                const depCheck = JSON.parse(fs.readFileSync('security-reports/dependency-check-report.json', 'utf8'));
+                const vulns = depCheck.dependencies?.filter(d => d.vulnerabilities?.length > 0) || [];
+                summary += `✅ **Dependency Check**: ${vulns.length} components with vulnerabilities\n`;
+              }
+            } catch (e) {
+              summary += "❌ **Dependency Check**: Report not available\n";
+            }
+
+            summary += "\n📦 **Artifacts available for download**:\n";
+            summary += "- SBOM (CycloneDX JSON)\n";
+            summary += "- Dependency Check reports (HTML/JSON)\n";
+            summary += "- npm audit report\n";
+            summary += "- Trivy SBOM analysis\n";
+            summary += "\n*Artifacts are stored for 7 days*";
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
