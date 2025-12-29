@@ -43,7 +43,6 @@ jobs:
         id: generate_sbom
         run: |
           cyclonedx-npm --output-file sbom.json
-          echo "SBOM generated: $(ls -la sbom.json)"
           echo "sbom_path=sbom.json" >> $GITHUB_OUTPUT
 
       - name: Upload SBOM artifact
