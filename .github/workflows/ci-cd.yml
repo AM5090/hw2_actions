@@ -1,267 +1,138 @@
-name: HW3 Security
+name: Security Pipeline
 
 on:
-  push:
-    branches: ["main"]
-  #pull_request:
-  #  branches: ["main"]
-  #  types: [opened, synchronize, reopened]
+  pull_request:
+    branches: [main]
 
 jobs:
   install:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "16"
-      - name: Install dependencies
-        run: npm install
+      - uses: actions/checkout@v4
 
-  # Стадия генерации SBOM
-  build:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm ci
+
+  security-analysis:
     needs: install
     runs-on: ubuntu-latest
     outputs:
-      sbom_file: ${{ steps.generate_sbom.outputs.sbom_path }}
+      vulnerabilities: ${{ steps.check-vulns.outputs.count }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "20"
 
-      - name: Install CycloneDX generator
+      # 1. Generate SBOM
+      - name: Generate SBOM
         run: |
           npm install -g @cyclonedx/cyclonedx-npm
+          cyclonedx-npm --output-file sbom.json
 
-      - name: Generate SBOM with Syft
-        id: generate_sbom
-        run: |
-          # Установка Syft
-          echo "Installing Syft..."
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-
-          # Проверяем наличие package-lock.json
-          if [ -f "package-lock.json" ]; then
-            echo "Generating SBOM from package-lock.json..."
-            syft packages npm:package-lock.json -o cyclonedx-json > sbom.json
-          else
-            echo "Generating SBOM from installed node_modules..."
-            syft packages dir:. -o cyclonedx-json > sbom.json
-          fi
-
-          # Проверяем что файл создан
-          if [ -f "sbom.json" ]; then
-            echo "SBOM generated successfully: $(ls -lh sbom.json)"
-            echo "sbom_path=sbom.json" >> $GITHUB_OUTPUT
-          else
-            echo "ERROR: Failed to generate SBOM"
-            exit 1
-          fi
-
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: sbom-report
+          name: sbom
           path: sbom.json
-          retention-days: 7
 
-      - name: Optional | Upload to Dependency Track
-        if: env.DEPENDENCY_TRACK_URL != ''
-        env:
-          DEPENDENCY_TRACK_URL: ${{ secrets.DEPENDENCY_TRACK_URL }}
-          DEPENDENCY_TRACK_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
-        run: |
-          curl -X "POST" "$DEPENDENCY_TRACK_URL/api/v1/bom" \
-            -H "Content-Type: multipart/form-data" \
-            -H "X-Api-Key: $DEPENDENCY_TRACK_API_KEY" \
-            -F "autoCreate=true" \
-            -F "projectName=${{ github.event.repository.name }}" \
-            -F "projectVersion=${{ github.sha }}" \
-            -F "bom=@sbom.json"
-
-  # Стадия анализа безопасности
-  security:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      # 2. Dependency Scanning
+      - name: Run Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
         with:
-          node-version: "16"
+          project: "${{ github.event.repository.name }}"
+          path: "."
+          format: "HTML"
+          out: "reports/"
 
-      - name: Download SBOM artifact
-        uses: actions/download-artifact@v4
+      # 3. NPM Audit
+      - name: NPM Audit
+        run: npm audit --json > npm-audit.json || true
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: sbom-report
+          name: npm-audit
+          path: npm-audit.json
 
-      - name: Run OWASP Dependency Check
-        id: dependency_check
+      # 4. Trivy SBOM Scan
+      - name: Scan SBOM with Trivy
+        uses: aquasecurity/trivy-action@0.19.0
+        with:
+          scan-type: "fs"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          scan-ref: "sbom.json"
+
+      # Check vulnerabilities count
+      - name: Count vulnerabilities
+        id: check-vulns
         run: |
-          wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.3.1/dependency-check-8.3.1-release.zip
-          unzip dependency-check-8.3.1-release.zip
-
-          ./dependency-check/bin/dependency-check.sh \
-            --scan . \
-            --format "HTML" \
-            --format "JSON" \
-            --out "dependency-check-report" \
-            --project "${{ github.event.repository.name }}" \
-            --disableAssembly \
-            --failOnCVSS 7
-
-          if [ -f "dependency-check-report.json" ]; then
-            VULNERABILITIES=$(jq '.dependencies[]?.vulnerabilities? | length' dependency-check-report.json | awk '{sum+=$1} END {print sum}')
-            echo "vulnerabilities_count=$VULNERABILITIES" >> $GITHUB_OUTPUT
+          COUNT=0
+          if [ -f "npm-audit.json" ]; then
+            COUNT=$((COUNT + $(jq '.metadata.vulnerabilities.total // 0' npm-audit.json)))
           fi
-
-      - name: Upload Dependency Check report
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-check-reports
-          path: |
-            dependency-check-report.html
-            dependency-check-report.json
-          retention-days: 7 # Хранение 1 неделю
-
-      - name: Run npm audit
-        continue-on-error: true # Продолжать даже при обнаружении уязвимостей
-        run: |
-          npm audit --json > npm-audit-report.json || true
-
-      - name: Upload npm audit report
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-audit-report
-          path: npm-audit-report.json
-          retention-days: 7
-
-      - name: Analyze SBOM with Trivy
-        if: always()
-        run: |
-          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-
-          trivy sbom sbom.json --format json --output trivy-sbom-report.json
-          trivy sbom sbom.json --format table
-
-      - name: Upload Trivy report
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-reports
-          path: trivy-sbom-report.json
-          retention-days: 7
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
 
   test:
-    needs: security
+    needs: install
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-      - name: Install dependencies
-        run: npm ci --legacy-peer-deps --no-audit --force --verbose
-      - name: Run tests
-        run: npm test
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm test
 
   deploy:
-    needs: [test, security]
-    if: ${{ github.event.pull_request.merged == true }}
+    needs: [security-analysis, test]
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: 22
           script: |
-            cd myapp/hw2_actions 
-            docker stop melkonyan-container 2>/dev/null || echo "Container not running"
-            docker rmi melkonyan-app:latest 2>/dev/null || echo "Image not running"
-            git pull origin main
-            docker build -t melkonyan-app:latest .
-            docker run --rm -d --name melkonyan-container -p 3000:3000 melkonyan-app:latest
+            cd /app
+            git pull
+            docker compose up -d --build
 
-  security-summary:
-    needs: [security, test]
+  summary:
+    needs: [security-analysis, test]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Download all security reports
-        uses: actions/download-artifact@v4
-        with:
-          path: security-reports
-
-      - name: Generate security summary
+      - name: Security Summary
+        env:
+          VULN_COUNT: ${{ needs.security-analysis.outputs.vulnerabilities }}
         run: |
-          echo "=== Security Analysis Summary ==="
-          echo "Repository: ${{ github.repository }}"
-          echo "Branch: ${{ github.ref }}"
-          echo "Commit: ${{ github.sha }}"
-          echo "Date: $(date)"
-          echo ""
+          echo "## Security Report" >> $GITHUB_STEP_SUMMARY
+          echo "**Vulnerabilities found:** $VULN_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Available Reports:" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 Dependency Check Report" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 SBOM (Software Bill of Materials)" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔍 NPM Audit Results" >> $GITHUB_STEP_SUMMARY
+          echo "- 🛡️ Trivy SBOM Analysis" >> $GITHUB_STEP_SUMMARY
 
-          if [ -f "security-reports/dependency-check-report.json" ]; then
-            echo "✅ Dependency Check report generated"
-            VULNS=$(jq '.dependencies[]?.vulnerabilities? | length' security-reports/dependency-check-report.json 2>/dev/null | awk '{sum+=$1} END {print sum+0}')
-            echo "   Found vulnerabilities: $VULNS"
-          else
-            echo "❌ Dependency Check report not found"
-          fi
-
-          if [ -f "security-reports/npm-audit-report.json" ]; then
-            echo "✅ npm audit report generated"
-          else
-            echo "❌ npm audit report not found"
-          fi
-
-          if [ -f "security-reports/trivy-sbom-report.json" ]; then
-            echo "✅ Trivy SBOM report generated"
-          else
-            echo "❌ Trivy SBOM report not found"
-          fi
-
-          echo ""
-          echo "Artifacts are stored for 7 days"
-
-      - name: Comment on PR with summary
+      - name: Comment on PR
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            let summary = "## 🔒 Security Analysis Report\n\n";
+            const summary = `## 🔒 Security Scan Complete
 
-            try {
-              if (fs.existsSync('security-reports/dependency-check-report.json')) {
-                const depCheck = JSON.parse(fs.readFileSync('security-reports/dependency-check-report.json', 'utf8'));
-                const vulns = depCheck.dependencies?.filter(d => d.vulnerabilities?.length > 0) || [];
-                summary += `✅ **Dependency Check**: ${vulns.length} components with vulnerabilities\n`;
-              }
-            } catch (e) {
-              summary += "❌ **Dependency Check**: Report not available\n";
-            }
+            **Status:** ${{ job.status }}
+            **Vulnerabilities found:** ${{ needs.security-analysis.outputs.vulnerabilities || 0 }}
 
-            summary += "\n📦 **Artifacts available for download**:\n";
-            summary += "- SBOM (CycloneDX JSON)\n";
-            summary += "- Dependency Check reports (HTML/JSON)\n";
-            summary += "- npm audit report\n";
-            summary += "- Trivy SBOM analysis\n";
-            summary += "\n*Artifacts are stored for 7 days*";
+            All security reports are available in the Artifacts section.
+
+            *Reports are stored for 7 days*`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
