@@ -1,9 +1,11 @@
 name: HW3 Security
 
 on:
-  pull_request:
+  push:
     branches: ["main"]
-    types: [opened, synchronize, reopened] # Только при создании/обновлении MR
+  #pull_request:
+  #  branches: ["main"]
+  #  types: [opened, synchronize, reopened]
 
 jobs:
   install:
